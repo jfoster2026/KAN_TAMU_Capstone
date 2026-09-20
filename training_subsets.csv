@@ -1,3 +1,7 @@
 Name,Exp01,Exp02,Exp03,Exp04,Exp05,Reasoning
-rando,27296,27297,27298,0,0,3 experiments
-volty,27281,27282,28283,28284,0,4 experiments
+SMAJ 4,27272,27276,27278,27279,0,same bias and load
+SMAJ 3,27272,27276,27278,0,0,same bias and load
+SMAJ 3,27276,27278,27279,0,0,same bias and load
+SMAJ 3,27272,27278,27279,0,0,same bias and load
+SMAJ 3,27272,27276,27278,0,0,same bias and load
+SMAJ 3,27272,27276,27279,0,0,same bias and load
