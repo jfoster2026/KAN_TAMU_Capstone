@@ -1,0 +1,5 @@
+.conda/
+# The files below are created from executing other code
+model/
+final_train_loss.csv
+LOO_training_subsets.csv
