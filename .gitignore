@@ -3,3 +3,4 @@
 model/
 final_train_loss.csv
 LOO_training_subsets.csv
+*.png

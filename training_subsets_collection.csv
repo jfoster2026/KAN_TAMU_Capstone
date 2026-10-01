@@ -1,0 +1,52 @@
+Name,Exp01,Exp02,Exp03,Exp04,Exp05,Exp06,Reasoning
+SMAJ 01-02,27271,27272,0,0,0,0,Using first set of two
+SMAJ 02-03,27272,27273,0,0,0,0,Next two
+SMAJ 03-04,27273,27274,0,0,0,0,These have similar shape. 73 has low load. 74 has high load.
+SMAJ 04-05,27274,27275,0,0,0,0,
+SMAJ 05-06,27275,27276,0,0,0,0,
+SMAJ 06-08,27276,27278,0,0,0,0,
+SMAJ 08-09,27278,27279,0,0,0,0,Similar shape and same parameters
+SMAJ 09-10,27279,27280,0,0,0,0,Similar shape. 79 has low load. 80 has high load.
+SMAJ 10-11,27280,27281,0,0,0,0,
+SMAJ 11-12,27281,27282,0,0,0,0,Similar shape
+SMAJ 12-13,27282,27283,0,0,0,0,
+SMAJ 13-14,27283,27284,0,0,0,0,
+#SMAJ 14-15,27284,27285,0,0,0,0,
+SMAJ 15-16,27285,27286,0,0,0,0,
+SMAJ 16-17,27286,27287,0,0,0,0,
+SMAJ 17-18,27287,27288,0,0,0,0,
+SMAJ 18-19,27288,27289,0,0,0,0,End of iterating through each pair
+SMAJ 01-03,27271,27272,27273,0,0,0,Start of 3 of nine
+SMAJ 02-04,27272,27273,27274,0,0,0,
+SMAJ 03-05,27273,27274,27275,0,0,0,
+SMAJ 04-06,27274,27275,27276,0,0,0,
+SMAJ 05-08,27275,27276,27278,0,0,0,
+SMAJ 06-09,27276,27278,27279,0,0,0,
+SMAJ 08-10,27278,27279,27280,0,0,0,End of 3 of nine
+SMAJ 01-04,27271,27272,27273,27274,0,0,Iterating through four of nine and stopping before oscillations
+SMAJ 02-05,27272,27273,27274,27275,0,0,
+SMAJ 03-06,27273,27274,27275,27276,0,0,
+SMAJ 04-08,27274,27275,27276,27278,0,0,
+SMAJ 05-09,27275,27276,27278,27279,0,0,
+SMAJ 06-10,27276,27278,27279,27280,0,0,End of four of nine
+SMAJ 84-88,27284,27286,27288,0,0,0,Messier SMAJ graphs
+SMAJ spikey hump,27273,27274,27284,27286,27288,0,Length 0.25 and spikey hump
+SMAJ simple curve,27272,27276,27278,0,0,0,Same parameters to make similar curve
+SMAJ simple curve 2,27272,27276,27278,27279,0,0,Same parameters to make similar curve
+SMAJ oscillations,27280,27281,27282,27283,0,0,Looks like the oscilation zooming out
+SMAJ similar time,27284,27286,27288,0,0,0,Same span of time and semi similar shapes
+MMSZ Spike,27290,27294,0,0,0,0,Same bias and low load
+MMSZ oscillation,27291,27295,0,0,0,0,Same bias and high load
+MMSZ different loads,27296,27297,0,0,0,0,Similar shape. 96 has low load. 97 has high load.
+MMSZ mixed 1,27290,27291,27296,0,0,0,"Mix a spike, oscillation, and up-down"
+MMSZ mixed 2,27294,27295,27297,0,0,0,"Mix a spike, oscillation, and up-down"
+MMSZ All of them,27290,27291,27294,27295,27296,27297,
+MMSZ w/o 91,27290,27297,27294,27295,27296,,Remove an oscillating experiment
+MMSZ w/o 95,27290,27291,27294,27296,27297,,Remove an oscillating experiment
+MMSZ w/o oscillations,27290,27294,27296,27297,,,No oscillating MMSZ
+CSD same spike,27298,27300,0,0,0,,Same parameters
+CSD exps,27298,27299,27300,0,0,,All the normal CSD files
+NJ same curve,27303,27304,0,0,0,,Same clean curve. 04 is double the time of 03
+NJ 03 and 05,27303,27305,0,0,0,,Same length of time. 05 is messier curve
+NJ 04 and 05,27304,27305,0,0,0,,Same length of time. 05 is messier curve
+NJ all,27303,27304,27305,0,0,,All the NJ
