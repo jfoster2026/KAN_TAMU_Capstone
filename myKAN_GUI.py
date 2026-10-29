@@ -4,10 +4,64 @@ import kan, torch
 import pandas as pd
 import numpy as np
 import os
+import re  # moved to top: needed by PATTERN below
 import matplotlib.pyplot as plt
 from kan import ex_round
+from pathlib import Path
+from torch.utils.flop_counter import FlopCounterMode
+
+# These functions: _n   _pw   _red   
+# are used for counting the computational cost of training and testing the model
+def _n(shape):
+    if isinstance(shape, torch.Size): return shape.numel()
+    if isinstance(shape, (tuple, list)): return sum(_n(s) for s in shape)
+    return 0
+
+def _pw(cost):                       # cost per output element
+    def f(*args, out_shape=None, **kw): return cost * _n(out_shape)
+    return f
+
+def _red(cost):                      # cost per input element
+    def f(in_shape, *args, out_shape=None, **kw): return cost * _n(in_shape)
+    return f
+
+aten = torch.ops.aten
+# Convention: add/sub/mul/div/compare/where = 1 FLOP, sigmoid = 1, silu = 2
+CUSTOM = {
+    **{op: _pw(1) for op in [aten.add, aten.add_, aten.sub, aten.sub_, aten.rsub,
+        aten.mul, aten.mul_, aten.div, aten.div_, aten.neg, aten.ge, aten.gt,
+        aten.le, aten.lt, aten.eq, aten.ne, aten.where, aten.nan_to_num,
+        aten.sigmoid, aten.sqrt, aten.addcmul_, aten.addcdiv_, aten.lerp_,
+        aten._foreach_add_, aten._foreach_mul_, aten._foreach_div_,
+        aten._foreach_sqrt, aten._foreach_addcmul_, aten._foreach_addcdiv_,
+        aten.abs, aten.sgn, aten.pow, aten.log2]},
+    aten.silu: _pw(2),
+    aten.silu_backward: _pw(5),
+    aten.sigmoid_backward: _pw(3),
+    aten.sum: _red(1), aten.mean: _red(1),
+    aten.std: _red(4), aten.var: _red(4),
+}
+def flop_counter():
+    return FlopCounterMode(display=False, custom_mapping=CUSTOM)
+
+# Without the functions above, counting the computational cost via FLOPs would be a lower bound
+# because a lot of things would not be counted.
 
 gui_state = {}  # ADDED FOR GUI: stores last trained model + ranges so single_test() can be triggered
+
+# To read files from a directory and output a list that contains all of their experiment numbers
+DIRECTORY = Path("data_for_model/")
+EXTENSION = ".csv"
+PATTERN = re.compile(r"LFXR_Lovejoy_Sept2021_(\d+)")  # capture group = the number
+
+def get_file_numbers():
+    numbers = []
+    for f in DIRECTORY.glob(f"*{EXTENSION}"):
+        match = PATTERN.search(f.stem)
+        if match:
+            numbers.append(int(match.group(1)))
+    return sorted(numbers)
+
 
 def normalize(x):  # min-max scaling
     if x.min() == x.max():
@@ -36,7 +90,7 @@ def train_model(expmnt, kan_width, kan_grid, kan_k, all_time, all_PCD, all_volt,
     for exp_num in expmnt:
         if exp_num == 0: continue
         # collect data from dataset
-        file_name = f"TestData\\LFXR_Lovejoy_Sept2021_{exp_num}.csv"
+        file_name = f"data_for_model\\LFXR_Lovejoy_Sept2021_{exp_num}.csv"  # matches get_file_numbers() directory
         df_train = pd.read_csv(file_name, usecols=[0,1,3])
 
         df_start_stop = pd.read_csv("start_stop_pts.csv")
@@ -130,20 +184,27 @@ def train_model(expmnt, kan_width, kan_grid, kan_k, all_time, all_PCD, all_volt,
         if grid != 0:
             print(f"Refined to {kan_grid + grid}")
             model.refine(kan_grid + grid)
-        results = model.fit(dataset,
-                opt="Adam", # Adam (faster) or LBFGS (slower)
-                steps=500,
-                lr=0.03, # was 0.016
-                update_grid=False,  # set to false for single experiment training.
-                start_grid_update_step= 100,
-                stop_grid_update_step= 120,
-                lamb=0.1,        # master scale — tune this first
-                lamb_l1=0.0,      # high — you want to prune weak connections
-                lamb_entropy=0.0, # high — encourages interpretable simple functions
-                lamb_coef=0.0,    # usually redundant if l1 is active
-                lamb_coefdiff=0.00) # smooth splines — important for noisy data)
+        with flop_counter() as fc_train:  # counts every op in the training cycle, using the CUSTOM costs
+            x=0
+            results = model.fit(dataset,
+                    opt="Adam", # Adam (faster) or LBFGS (slower)
+                    steps=300,
+                    lr=0.03, # was 0.016
+                    update_grid=False,  # set to false for single experiment training.
+                    start_grid_update_step= 100,
+                    stop_grid_update_step= 120,
+                    lamb=0.1,        # master scale — tune this first
+                    lamb_l1=0.0,      # high — you want to prune weak connections
+                    lamb_entropy=0.0, # high — encourages interpretable simple functions
+                    lamb_coef=0.0,    # usually redundant if l1 is active
+                    lamb_coefdiff=0.00) # smooth splines — important for noisy data)
     train_losses += results['train_loss']
     test_losses += results['test_loss']
+    train_flops_total = fc_train.get_total_flops()
+    train_flops_point = train_flops_total / X.shape[0]
+
+    print(f"FLOPs for the training cycle: {train_flops_total:,.1f}")
+    print(f"FLOPs for the each point: {train_flops_point:,.1f}")
     # The losses are already NRMSE because all of the data (input and output) is normalized to the range of 0 to 1
 
     # # plot the two losses
@@ -155,27 +216,98 @@ def train_model(expmnt, kan_width, kan_grid, kan_k, all_time, all_PCD, all_volt,
     # plt.yscale('log')
     # plt.show()
 
-    return model, dataset, expmnt_size
+    return model, dataset, expmnt_size, train_flops_total, train_flops_point
 
 
 
 
 
-def plot_results(model, dataset, time_mx_mn, PCD_mx_mn, volt_mx_mn, expmnt, expmnt_size, train_ratio):    
+def get_metrics (v_true, v_pred):
+    # MSE and RMSE
+    mse = torch.mean((v_pred - v_true) ** 2).item() 
+
+    # ADDED FOR GUI: tensors come in as (N,1) and possibly on the GPU. Flatten to 1-D numpy so the
+    # np.sort / np.corrcoef calls below work (on (N,1) they sort nothing and return NaN).
+    v_true = v_true.detach().cpu().numpy().ravel()
+    v_pred = v_pred.detach().cpu().numpy().ravel()
+
+    rmse = mse ** 0.5
+    nrmse = round(rmse / float((v_true.max() - v_true.min())),5)  # this gives the NRMSE relative to the values in the experiment set.
+
+    # Wasserstein magnitude comparing
+    w = np.mean(np.abs(np.sort(v_true) - np.sort(v_pred)))
+    w_norm = round(100 * w / (v_true.max() - v_true.min()),3)
+
+    # R squared value
+    ss_res = np.sum((v_true - v_pred) ** 2)
+    ss_tot = np.sum((v_true - np.mean(v_true)) ** 2)
+    r_squared = round(1 - ss_res / ss_tot, 4)
+
+    # Find the shift value that give the best Pearson correlation value
+    current_r = 0.0
+    best_r = -5.0
+    best_lag_value = 0
+    num_lags = 50
+    
+    for k in range(-num_lags, num_lags + 1):
+        if k >= 0: # drop true beginnning and pred end. Shift the predicted to the right
+            a, b = v_true[k:], v_pred[:len(v_pred) - k]
+        else: # shift predicted to the left
+            a, b = v_true[:k], v_pred[-k:]
+        r = np.corrcoef(a, b)[0, 1]
+        if k == 0:
+            current_r = r
+        if r > best_r:
+            best_r = r # get a new best performance
+            best_lag_value = k
+
+    return nrmse, r_squared, w_norm, round(current_r,4) , round(best_r, 4), best_lag_value
+
+
+def _fmt_flops(x):  # ADDED FOR GUI: readable FLOP counts, e.g. 1.23 GFLOPs
+    for unit, scale in (("Tera", 1e12), ("Giga", 1e9), ("Mega", 1e6), ("Kilo", 1e3)):
+        if abs(x) >= scale:
+            return f"{x / scale:.2f} {unit}FLOPs"
+    return f"{x:.0f} FLOPs"
+
+
+def format_metrics(m, one_line=False):  # ADDED FOR GUI: text used by the Metrics panel and figure headers
+    items = [f"NRMSE: {m['nrmse'] * 100:.3f}%",
+             f"R\u00b2: {m['r_squared']:.4f}",
+             f"Wasserstein: {m['w_norm']:.3f}%",
+             f"Pearson r: {m['current_r']:.4f}",
+             f"Best r: {m['best_r']:.4f} (lag {m['best_lag']:+d})"]
+    if not one_line and "train_flops" in m:  # training cost is only shown in the panel, not the figure headers
+        items.append(f"Training cost: {_fmt_flops(m['train_flops'])}")
+        items.append(f"Training cost/point: {_fmt_flops(m['train_flops_point'])}")
+    if "infer_flops_per_sample" in m:
+        items.append(f"Inference cost/point: {_fmt_flops(m['infer_flops_per_sample'])}")
+    return "  |  ".join(items) if one_line else "\n".join(items)
+
+
+def plot_results(model, dataset, time_mx_mn, PCD_mx_mn, volt_mx_mn, expmnt, expmnt_size, train_ratio, extra_metrics=None):    
 
     t = dataset["test_input"][:, 0]   # assumes column 0 is time
     r = dataset["test_input"][:, 2]   # assumes column 2 is radiation
     v = dataset["test_label"]         # voltage target (expected value, correct answer)
     b = dataset["test_input"][:, 3]   # assumes column 3 is bias
 
-    with torch.no_grad():
+    with torch.no_grad(), flop_counter() as fc_inf:  # counts the forward pass, using the CUSTOM costs
         v_pred = model(dataset["test_input"])
-    # MSE and RMSE in percentage form
-    mse = torch.mean((v_pred - v) ** 2).item() 
-    print(f"{expmnt} Test MSE: {mse * 100:.3f}%")
-    rmse = mse ** 0.5
-    nrmse = rmse / float((v.max() - v.min())) # this gives the NRMSE relative to the values in the experiment set.
-    print(f"{expmnt} Test NRMSE: {nrmse * 100:.3f}%") 
+    n_pts = dataset["test_input"].shape[0]
+    infer_flops_per_sample = fc_inf.get_total_flops() / n_pts
+    print(f"FLOPs to predict per data point: {infer_flops_per_sample:,.2f}")
+
+    nrmse, r_squared, w_norm, current_r, best_r, best_lag_value = get_metrics(v_true = v, v_pred = v_pred)
+    metrics = dict(nrmse=float(nrmse), r_squared=float(r_squared), w_norm=float(w_norm),
+                   current_r=float(current_r), best_r=float(best_r), best_lag=int(best_lag_value),
+                   infer_flops_per_sample=float(infer_flops_per_sample))
+    if extra_metrics:  # e.g. training FLOPs, passed in by perform_training
+        metrics.update(extra_metrics)
+    print(f"{expmnt} Test metrics: {format_metrics(metrics, one_line=True)}")
+    cb = gui_state.get("on_metrics")  # ADDED FOR GUI: sends the metrics to the GUI panel (set in KANApp._run)
+    if cb:
+        cb(metrics)
     
 
     test_results_idx = 0
@@ -225,35 +357,11 @@ def plot_results(model, dataset, time_mx_mn, PCD_mx_mn, volt_mx_mn, expmnt, expm
         plt.title(f"Experiment {i}")
         plt.legend()
         plt.show()
-    return round(nrmse * 100, 2) # return the NRMSE as a percent
+    return metrics # dict: nrmse (fraction), r_squared, w_norm (%), current_r, best_r, best_lag, infer_flops_per_sample (+ training FLOPs when passed in)
 
 
 
 # Used to test the model using a single experiment to test generalization.
-def plot_losses(filename_list, arch):
-    # plot the losses from perform_training() as a scatter plot
-    # arch is the architecture of the model
-    # can receive multiple files names to compare those two runs
-    
-    dot_colors = ['g','r','b','o']
-    special_lables = ["New", "Old"]
-    plt.figure(figsize=(12,4))
-    for idx, filename in enumerate(filename_list):
-        losses_df = pd.read_csv(filename)
-        plt.plot(range(len(losses_df["Error"])), losses_df["Error"], 
-                    marker = 'o', linestyle = '-', color = dot_colors[idx], label = special_lables[idx]) #arch[idx]) 
-        plt.xlabel("Trial")
-        plt.ylabel("Error (%)")
-        plt.title("Error for each trial")
-        #plt.axhline(10, color = 'k', linestyle="--", linewidth = 1) # k is black
-    plt.ylim(bottom=0)
-    plt.legend()
-    plt.savefig(f"training_errors_{arch[0]}.png")
-    plt.show()
-    
-
-    
-
 def single_test(model, exp_num, time_mx_mn, PCD_mx_mn, volt_mx_mn, bias_mx_mn, load_mx_mn):
     print(f"Testing with experiment {exp_num}...")
     #reset variables
@@ -339,36 +447,47 @@ def single_test(model, exp_num, time_mx_mn, PCD_mx_mn, volt_mx_mn, bias_mx_mn, l
         "test_label":  torch.from_numpy(all_volt).reshape(-1,1).to(device),
     }
     exp_num = [exp_num]
-    nrmse = plot_results(model, dataset, time_mx_mn, PCD_mx_mn, volt_mx_mn, exp_num, expmnt_size, train_ratio = 0)
-    return nrmse
+    metrics = plot_results(model, dataset, time_mx_mn, PCD_mx_mn, volt_mx_mn, exp_num, expmnt_size, train_ratio = 0)
+    return metrics
 
     
 
 def perform_training(kan_width, kan_grid, kan_k, LOO = False):
 
     # IF something does not work, the bias is being used to scale down voltage and then scale it up again in plotting.
-    # add a  #  to a row to make the training stop early
-    if LOO:
+    # Make false to use data_for_model and automated directory reading (the only option the GUI uses)
+    multi_train = False
+    # add a  #  to a row to make the training stop early in either multiple training options
+    if LOO & multi_train:
         filename = "LOO_training_subsets.csv"
         subsets_df = pd.read_csv(filename)
         train_these = subsets_df.drop(columns=["Name", "Test", "Reasoning"]).to_numpy().tolist()
         test_these = subsets_df["Test"]
         
-    else:
+    elif multi_train:
         filename = "training_subsets.csv"
         subsets_df = pd.read_csv(filename)
         train_these = subsets_df.drop(columns=["Name", "Reasoning"]).to_numpy().tolist()
 
+    else:
+        file_numbers = get_file_numbers()
+        if not file_numbers:
+            print(f"No files matching {PATTERN.pattern} found in {DIRECTORY}. Nothing to train on.")
+            return
+        print(f"Found {len(file_numbers)} experiment files: {file_numbers}")
+        train_these = [file_numbers]  # ASSUMPTION: one training set containing every file found
+        subsets_df = pd.DataFrame([0,1,2,3,4])
+
 
     final_train_losses = []
     final_test_losses = []
-    new_file_row_count = 0
     for idx, i in enumerate(train_these):
-        if '#' in subsets_df["Name"].iloc[idx]: 
-            print(f"Terminated early at index {idx}")
-            break
+        if multi_train:
+            # subsets is only defined when multi_train is True
+            if '#' in subsets_df["Name"].iloc[idx]: 
+                print(f"Terminated early at index {idx}")
+                break
         print(f"Processing experiment {i}...")
-        new_file_row_count += 1
         #reset variables
         all_time = np.array([], dtype = "float32")
         time_mx_mn = [6.5, 0.0]
@@ -384,27 +503,24 @@ def perform_training(kan_width, kan_grid, kan_k, LOO = False):
         train_losses = []
         test_losses = []
         train_ratio = 0.7  # Use 70% of the data for training
-        if any(item in i for item in [27277, 27292, 27293, 27306]): 
+        if any(item in i for item in [27292, 27293]): 
             print(f"This subset {i} has an unusable experiment. Skipping")
         else:
             expmnt = i
 
 
-            M1, data1, expmnt_size = train_model(expmnt, kan_width, kan_grid, kan_k, all_time, all_PCD, all_volt, all_bias, 
+            M1, data1, expmnt_size, train_flops, train_flops_point = train_model(expmnt, kan_width, kan_grid, kan_k, all_time, all_PCD, all_volt, all_bias, 
                                                 all_load, time_mx_mn, PCD_mx_mn, volt_mx_mn, bias_mx_mn, load_mx_mn,
                                                 train_losses, test_losses, train_ratio, LOO_test = LOO)
             gui_state.update(model=M1, time_mx_mn=time_mx_mn, PCD_mx_mn=PCD_mx_mn, volt_mx_mn=volt_mx_mn,
                              bias_mx_mn=bias_mx_mn, load_mx_mn=load_mx_mn)  # ADDED FOR GUI
             final_train_losses.append(round(float(test_losses[-1])*100,3)) # already in percentage form and rounded
-            nrmse = plot_results(M1, data1, time_mx_mn, PCD_mx_mn, volt_mx_mn, expmnt, expmnt_size, train_ratio)
+            metrics = plot_results(M1, data1, time_mx_mn, PCD_mx_mn, volt_mx_mn, expmnt, expmnt_size, train_ratio,
+                                   extra_metrics=dict(train_flops=train_flops, train_flops_point=train_flops_point))
             if LOO:
                 final_test_losses.append(single_test(M1, subsets_df["Test"].iloc[idx],
-                                                     time_mx_mn, PCD_mx_mn, volt_mx_mn, bias_mx_mn, load_mx_mn))
+                                                     time_mx_mn, PCD_mx_mn, volt_mx_mn, bias_mx_mn, load_mx_mn)["nrmse"] * 100)  # percent
 
-    train_loss_df = pd.DataFrame({"Name"  : subsets_df["Name"].iloc[:new_file_row_count], 
-                                    "Error" : final_train_losses,
-                                    "Reasoning": subsets_df["Reasoning"].iloc[:new_file_row_count]})
-    train_loss_df.to_csv(f"final_train_loss_{kan_width[1][0]}.csv", index=False) # for some reason its making nested lists.
     print(f"Training Test Error Rates: {final_train_losses}")
     if LOO:
         print(f"LOO Testing Error Rates: {final_test_losses}")
@@ -444,7 +560,6 @@ def perform_LOO_training():
  
 #perform_LOO_training()
 
-# plot_losses(["final_train_loss_8_new.csv","final_train_loss_8.csv"], [[5,8,1],[4,8,1]])   # now launched from the GUI
 
 
 # =====================================================================
@@ -474,7 +589,7 @@ class KANApp(tk.Tk):
         self.geometry("1250x850")
         self.q = queue.Queue()
         self.busy = False
-        self.latest_nrmse = None
+        self.latest_metrics = None
         self._build()
         self.after(100, self._poll)
 
@@ -484,7 +599,7 @@ class KANApp(tk.Tk):
         left.pack(side="left", fill="y")
 
         # --- training controls ---
-        tf = ttk.LabelFrame(left, text="Training (perform_training)", padding=8)
+        tf = ttk.LabelFrame(left, text="Training (get_file_numbers)", padding=8)
         tf.pack(fill="x", pady=4)
         self.width_var = tk.StringVar(value="[4,8,8,1]")
         self.grid_var = tk.StringVar(value="30")
@@ -496,8 +611,8 @@ class KANApp(tk.Tk):
             ttk.Entry(tf, textvariable=var, width=14).grid(row=r, column=1, pady=2)
         self.train_btn = ttk.Button(tf, text="Run model training", command=self.on_train)
         self.train_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 2))
-        self.loo_btn = ttk.Button(tf, text="Run LOO training", command=self.on_loo)
-        self.loo_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(tf, text="Trains on every file found in data_for_model/.",
+                  foreground="gray").grid(row=4, column=0, columnspan=2, sticky="w")
 
         # --- single test controls ---
         sf = ttk.LabelFrame(left, text="Single test (single_test)", padding=8)
@@ -511,12 +626,24 @@ class KANApp(tk.Tk):
                   foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w")
 
         # --- results ---
-        rf = ttk.LabelFrame(left, text="NRMSE", padding=8)
+        rf = ttk.LabelFrame(left, text="Metrics", padding=8)
         rf.pack(fill="x", pady=4)
-        self.train_nrmse_lbl = ttk.Label(rf, text="Training: --", font=("TkDefaultFont", 11, "bold"))
-        self.train_nrmse_lbl.pack(anchor="w")
-        self.single_nrmse_lbl = ttk.Label(rf, text="Single test: --", font=("TkDefaultFont", 11, "bold"))
-        self.single_nrmse_lbl.pack(anchor="w")
+        self.train_hdr_lbl = ttk.Label(rf, text="Training: --", font=("TkDefaultFont", 11, "bold"))
+        self.train_hdr_lbl.pack(anchor="w")
+        self.train_metrics_lbl = ttk.Label(rf, text="", justify="left")
+        self.train_metrics_lbl.pack(anchor="w", padx=(10, 0), pady=(0, 6))
+        self.single_hdr_lbl = ttk.Label(rf, text="Single test: --", font=("TkDefaultFont", 11, "bold"))
+        self.single_hdr_lbl.pack(anchor="w")
+        self.single_metrics_lbl = ttk.Label(rf, text="", justify="left")
+        self.single_metrics_lbl.pack(anchor="w", padx=(10, 0))
+
+        # --- notes ---
+        nf = ttk.LabelFrame(left, text="Notes", padding=8)
+        nf.pack(fill="x", pady=4)
+        ttk.Label(nf, wraplength=270, justify="left",
+                  text="Training metrics are currently calculated for the entire training set "
+                       "(all experiments pooled together), not by experiment. "
+                       "Single test metrics are for the one experiment tested.").pack(anchor="w")
 
         self.status_lbl = ttk.Label(left, text="Idle")
         self.status_lbl.pack(anchor="w", pady=6)
@@ -540,7 +667,7 @@ class KANApp(tk.Tk):
     def _set_busy(self, busy, text=None):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for b in (self.train_btn, self.loo_btn, self.single_btn):
+        for b in (self.train_btn, self.single_btn):
             b.config(state=state)
         self.status_lbl.config(text=text if text else ("Running..." if busy else "Idle"))
 
@@ -554,11 +681,11 @@ class KANApp(tk.Tk):
         for tab in nb.tabs():
             nb.nametowidget(tab).destroy()
 
-    def _add_figure(self, nb, fig, nrmse):
+    def _add_figure(self, nb, fig, metrics):
         frame = ttk.Frame(nb)
         title = fig.axes[0].get_title() if fig.axes else "Figure"
-        if title.startswith("Experiment") and nrmse is not None:
-            ttk.Label(frame, text=f"{title}   |   NRMSE: {nrmse}%",
+        if title.startswith("Experiment") and metrics is not None:
+            ttk.Label(frame, text=f"{title}   |   {format_metrics(metrics, one_line=True)}",
                       font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=4)
         canvas = FigureCanvasTkAgg(fig, master=frame)
         toolbar = NavigationToolbar2Tk(canvas, frame)
@@ -573,14 +700,16 @@ class KANApp(tk.Tk):
         if self.busy:
             return
         self._set_busy(True)
-        self.latest_nrmse = None
+        self.latest_metrics = None
         if kind == "train":
             self._clear_nb(self.train_nb)
-            self.train_nrmse_lbl.config(text="Training: --")
+            self.train_hdr_lbl.config(text="Training: --")
+            self.train_metrics_lbl.config(text="")
             self.top_nb.select(self.train_nb)
         else:
             self._clear_nb(self.single_nb)
-            self.single_nrmse_lbl.config(text="Single test: --")
+            self.single_hdr_lbl.config(text="Single test: --")
+            self.single_metrics_lbl.config(text="")
             self.top_nb.select(self.single_nb)
 
         def worker():
@@ -592,6 +721,7 @@ class KANApp(tk.Tk):
                 self.q.put(("fig", kind, fig))
                 plt.close(fig)
             plt.show = gui_show
+            gui_state["on_metrics"] = lambda m: self.q.put(("metrics", kind, m))  # plot_results -> GUI panel
             try:
                 result = func(*args)
                 self.q.put(("done", kind, result))
@@ -599,6 +729,7 @@ class KANApp(tk.Tk):
                 self.q.put(("error", traceback.format_exc()))
             finally:
                 sys.stdout, plt.show = old_out, old_show
+                gui_state.pop("on_metrics", None)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -614,9 +745,6 @@ class KANApp(tk.Tk):
             messagebox.showerror("Invalid input", str(e))
             return
         self._run(perform_training, "train", kan_width, kan_grid, kan_k)
-
-    def on_loo(self):
-        self._run(perform_LOO_training, "train")
 
     def on_single(self):
         if "model" not in gui_state:
@@ -638,19 +766,19 @@ class KANApp(tk.Tk):
                 msg = self.q.get_nowait()
                 if msg[0] == "log":
                     self._log(msg[1])
-                    m = re.search(r"Test NRMSE:\s*([-\d.]+)%", msg[1])
-                    if m:
-                        self.latest_nrmse = m.group(1)
-                        self.status_lbl.config(text=f"Running... (latest NRMSE {self.latest_nrmse}%)")
+                elif msg[0] == "metrics":
+                    self.latest_metrics = msg[2]
+                    if msg[1] == "train":
+                        self.train_hdr_lbl.config(text="Training (last test set):")
+                        self.train_metrics_lbl.config(text=format_metrics(msg[2]))
+                    else:
+                        self.single_hdr_lbl.config(text="Single test:")
+                        self.single_metrics_lbl.config(text=format_metrics(msg[2]))
+                    self.status_lbl.config(text=f"Running... (latest NRMSE {msg[2]['nrmse'] * 100:.2f}%)")
                 elif msg[0] == "fig":
                     nb = self.train_nb if msg[1] == "train" else self.single_nb
-                    self._add_figure(nb, msg[2], self.latest_nrmse)
+                    self._add_figure(nb, msg[2], self.latest_metrics)
                 elif msg[0] == "done":
-                    if msg[1] == "train":
-                        if self.latest_nrmse is not None:
-                            self.train_nrmse_lbl.config(text=f"Training (last test set): {self.latest_nrmse}%")
-                    else:
-                        self.single_nrmse_lbl.config(text=f"Single test: {msg[2]}%")
                     self._set_busy(False, "Done")
                 elif msg[0] == "error":
                     self._log(msg[1])
